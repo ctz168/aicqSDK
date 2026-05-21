@@ -2,21 +2,7 @@
 # 当公开仓 ctz168/aicqSDK 的 main 分支有更新时：
 # 1. 替换 pyproject.toml 中的 Repository/Issues URL 指向公开仓
 # 2. 验证 SDK 默认连接地址指向官网 aicq.online
-# 3. 构建并发布到 PyPI
-#
-# 发布方式（二选一）：
-#   方式A: Trusted Publisher (OIDC) — 无需存储任何 Token（推荐，更安全）
-#     需要在 PyPI 上配置 Trusted Publisher:
-#       PyPI → Account settings → Publishing → Add a new publisher
-#       Repository owner: ctz168
-#       Repository name: aicqSDK
-#       Workflow filename: publish-sdk.yml
-#       Environment name: pypi
-#     配置完成后，将 password 行改为: password: ${{ secrets.PYPI_API_TOKEN }}
-#     删除下面的，改为: attestations: true
-#
-#   方式B: API Token — 当前使用
-#     在 GitHub Secrets 中添加 PYPI_API_TOKEN
+# 3. 构建并发布到 PyPI（使用 Trusted Publisher OIDC，无需存储任何 Token）
 
 name: Build and Publish aicqSDK
 
@@ -48,7 +34,6 @@ jobs:
       - name: Replace URLs for public repo
         run: |
           echo "=== 替换 pyproject.toml 中的 URL ==="
-          # 替换 Repository 和 Issues 指向公开仓
           sed -i 's|Repository = "https://github.com/ctz168/aicq"|Repository = "https://github.com/ctz168/aicqSDK"|g' pyproject.toml
           sed -i 's|Issues = "https://github.com/ctz168/aicq/issues"|Issues = "https://github.com/ctz168/aicqSDK/issues"|g' pyproject.toml
 
@@ -64,15 +49,13 @@ jobs:
       - name: Install build tools
         run: |
           python -m pip install --upgrade pip
-          pip install build twine
+          pip install build
 
       - name: Build package
         run: |
           python -m build
 
       - name: Publish to PyPI
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-        run: |
-          twine upload dist/*
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          attestations: true
