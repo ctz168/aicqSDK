@@ -1,8 +1,22 @@
 # 工作流2: 公开仓 aicqSDK 自动替换连接地址 + 发布到 PyPI
 # 当公开仓 ctz168/aicqSDK 的 main 分支有更新时：
 # 1. 替换 pyproject.toml 中的 Repository/Issues URL 指向公开仓
-# 2. 修正包入口脚本名（避免与 sdk 目录冲突）
-# 3. 构建并发布到 PyPI（使用 Trusted Publisher OIDC，无需 Token）
+# 2. 验证 SDK 默认连接地址指向官网 aicq.online
+# 3. 构建并发布到 PyPI
+#
+# 发布方式（二选一）：
+#   方式A: Trusted Publisher (OIDC) — 无需存储任何 Token（推荐，更安全）
+#     需要在 PyPI 上配置 Trusted Publisher:
+#       PyPI → Account settings → Publishing → Add a new publisher
+#       Repository owner: ctz168
+#       Repository name: aicqSDK
+#       Workflow filename: publish-sdk.yml
+#       Environment name: pypi (或留空)
+#     配置完成后，删除下面的 PYPI_API_TOKEN 相关行，只保留 OIDC 部分
+#
+#   方式B: API Token — 需要在 GitHub Secrets 中添加 PYPI_API_TOKEN
+#     当前使用此方式，后续建议切换到方式A
+
 name: Build and Publish aicqSDK
 
 on:
@@ -16,10 +30,11 @@ on:
 jobs:
   build-and-publish:
     runs-on: ubuntu-latest
+    environment: pypi
     permissions:
       # Trusted Publisher (OIDC) 需要的权限
       id-token: write
-      contents: write
+      contents: read
 
     steps:
       - name: Checkout
@@ -59,10 +74,5 @@ jobs:
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          # 使用 Trusted Publisher (OIDC) — 无需存储任何 Token！
-          # 需要在 PyPI 上配置 Trusted Publisher:
-          #   Repository owner: ctz168
-          #   Repository name: aicqSDK
-          #   Workflow filename: publish-sdk.yml
-          #   Environment: (留空或设为 pypi)
+          password: ${{ secrets.PYPI_API_TOKEN }}
           attestations: true
