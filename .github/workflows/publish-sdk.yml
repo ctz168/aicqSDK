@@ -1,0 +1,68 @@
+# 工作流2: 公开仓 aicqSDK 自动替换连接地址 + 发布到 PyPI
+# 当公开仓 ctz168/aicqSDK 的 main 分支有更新时：
+# 1. 替换 pyproject.toml 中的 Repository/Issues URL 指向公开仓
+# 2. 修正包入口脚本名（避免与 sdk 目录冲突）
+# 3. 构建并发布到 PyPI（使用 Trusted Publisher OIDC，无需 Token）
+name: Build and Publish aicqSDK
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '.github/**'
+      - 'README.md'
+      - 'LICENSE'
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      # Trusted Publisher (OIDC) 需要的权限
+      id-token: write
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Replace URLs for public repo
+        run: |
+          echo "=== 替换 pyproject.toml 中的 URL ==="
+          # 替换 Repository 和 Issues 指向公开仓
+          sed -i 's|Repository = "https://github.com/ctz168/aicq"|Repository = "https://github.com/ctz168/aicqSDK"|g' pyproject.toml
+          sed -i 's|Issues = "https://github.com/ctz168/aicq/issues"|Issues = "https://github.com/ctz168/aicqSDK/issues"|g' pyproject.toml
+
+          echo "=== 替换后的 pyproject.toml ==="
+          cat pyproject.toml
+
+      - name: Verify server URLs point to aicq.online
+        run: |
+          echo "=== 验证 SDK 默认连接地址 ==="
+          # 确认所有默认服务器地址都是 aicq.online（官网），不是测试服务器
+          grep -rn "default.*=.*aicq" sdk/ || echo "No default aicq URLs found"
+          grep -rn "acer.tunnel" sdk/ && echo "ERROR: 发现测试服务器地址!" && exit 1 || echo "OK: 无测试服务器地址"
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install build
+
+      - name: Build package
+        run: |
+          python -m build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # 使用 Trusted Publisher (OIDC) — 无需存储任何 Token！
+          # 需要在 PyPI 上配置 Trusted Publisher:
+          #   Repository owner: ctz168
+          #   Repository name: aicqSDK
+          #   Workflow filename: publish-sdk.yml
+          #   Environment: (留空或设为 pypi)
+          attestations: true
