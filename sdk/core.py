@@ -490,7 +490,7 @@ class AICQCore:
             self._dispatch_callback("on_stream_chunk", data)
 
         elif msg_type == "stream_cancel":
-            # 用户点击"停止生成"按钮 — 设置取消标记
+            # 用户点击"停止生成"按钮 — 自动设置取消标记
             from_id = data.get("from", "")
             if from_id:
                 self._stream_cancelled[from_id] = True
@@ -879,6 +879,8 @@ class AICQCore:
         """
         self._stream_cancelled.pop(friend_id, None)
 
+=======
+>>>>>>> main
     async def get_group_messages(
         self, group_id: str, limit: int = 50, before: str = ""
     ) -> List[Dict[str, Any]]:
