@@ -64,6 +64,8 @@ class AICQCore:
         self._agent: Optional[Dict[str, Any]] = None
         # 临时房间状态
         self._ephemeral: Optional[Dict[str, Any]] = None
+        # 流式输出取消标记: friend_id → bool
+        self._stream_cancelled: Dict[str, bool] = {}
 
     # ─── HTTP 辅助 ──────────────────────────────────────────────
 
@@ -487,6 +489,17 @@ class AICQCore:
             # 流式消息片段
             self._dispatch_callback("on_stream_chunk", data)
 
+        elif msg_type == "stream_cancel":
+            # 用户点击"停止生成"按钮 — 设置取消标记
+            from_id = data.get("from", "")
+            if from_id:
+                self._stream_cancelled[from_id] = True
+            self._dispatch_callback("on_stream_cancel", data)
+
+        elif msg_type == "stream_cancel_ack":
+            # 服务器确认已转发取消请求
+            logger.info("流式输出取消已确认，from=%s", data.get("from"))
+
         elif msg_type == "group_messages":
             # 群组消息历史响应（来自 get_group_messages 请求）
             request_id = data.get("_requestId")
@@ -732,6 +745,139 @@ class AICQCore:
         except Exception:
             # 临时房间可能无法保存到数据库，忽略
             pass
+
+    # ─── 流式输出 ───────────────────────────────────────────────
+
+    async def send_stream_chunk(
+        self,
+        friend_id: str,
+        chunk_type: str = "text",
+        data: Any = "",
+    ):
+        """发送流式消息片段给好友。
+
+        用于智能体与好友私聊时实时流式输出内容。客户端
+        (chat.html) 会根据 chunkType 渲染对应 UI：
+        ``text`` / ``reasoning`` / ``thinking`` / ``tool_call`` /
+        ``tool_result`` / ``clear_text`` / ``reasoning_end``。
+
+        典型用法::
+
+            # 开始流式输出
+            await core.send_stream_chunk(friend_id, "text", "你好")
+            await core.send_stream_chunk(friend_id, "text", "，我是AI助手")
+
+            # 工具调用
+            await core.send_stream_chunk(friend_id, "tool_call", {
+                "name": "web_search",
+                "input": {"query": "天气预报"}
+            })
+
+            # 工具结果
+            await core.send_stream_chunk(friend_id, "tool_result", {
+                "output": "今天晴天，25°C"
+            })
+
+            # 清除文本缓冲（开始新一轮输出）
+            await core.send_stream_chunk(friend_id, "clear_text", "")
+
+            # 结束流式输出
+            await core.send_stream_end(friend_id)
+
+        Args:
+            friend_id: 好友账户 ID
+            chunk_type: 片段类型，支持:
+                - ``text``: 文本内容片段
+                - ``reasoning``: 推理/思考过程片段
+                - ``thinking``: 思考状态标记
+                - ``reasoning_end``: 推理结束标记
+                - ``clear_text``: 清除当前文本缓冲区（多轮工具调用之间）
+                - ``tool_call``: 工具调用，data 为 ``{"name": ..., "input": ...}``
+                - ``tool_result``: 工具结果，data 为 ``{"output": ..., "success": ...}``
+            data: 片段数据，类型取决于 chunk_type
+        """
+        if self.ws is None or self.ws.closed:
+            raise AICQConnectionError("WebSocket 未连接")
+
+        msg = {
+            "type": "stream_chunk",
+            "to": friend_id,
+            "chunkType": chunk_type,
+            "data": data,
+        }
+        await self.ws.send_json(msg)
+
+    async def send_stream_end(self, friend_id: str, message_id: str = ""):
+        """发送流式输出结束信号。
+
+        必须在 ``send_stream_chunk`` 序列的末尾调用，客户端
+        据此将流式消息转为最终消息并持久化。
+
+        Args:
+            friend_id: 好友账户 ID
+            message_id: 可选的消息 ID，用于关联流与最终消息
+        """
+        if self.ws is None or self.ws.closed:
+            raise AICQConnectionError("WebSocket 未连接")
+
+        msg: Dict[str, Any] = {
+            "type": "stream_end",
+            "to": friend_id,
+        }
+        if message_id:
+            msg["messageId"] = message_id
+        await self.ws.send_json(msg)
+
+    def on_stream_cancel(self, callback: Callable):
+        """注册流式输出取消回调。
+
+        当用户在前端点击"停止生成"按钮时，服务器会转发
+        ``stream_cancel`` 消息给智能体。SDK 会自动设置取消标记
+        （可通过 ``is_stream_cancelled()`` 轮询），同时触发此回调。
+
+        智能体通常有两种方式处理取消：
+
+        1. **回调方式**：在回调中设置自定义标记或取消 asyncio Task
+        2. **轮询方式**：在 LLM 工具循环中调用 ``is_stream_cancelled()``
+
+        推荐使用轮询方式，因为它不依赖回调的时序。
+
+        Args:
+            callback: 回调函数，接收 ``{"from": user_id}`` 字典
+        """
+        self._callbacks["on_stream_cancel"] = callback
+
+    def is_stream_cancelled(self, friend_id: str) -> bool:
+        """检查某个好友是否请求了取消流式输出。
+
+        在 LLM 工具调用循环中轮询此方法，以便及时中止执行。
+
+        典型用法::
+
+            while round < MAX_ROUNDS:
+                if core.is_stream_cancelled(friend_id):
+                    await core.send_stream_end(friend_id)
+                    core.clear_stream_cancel(friend_id)
+                    break
+                # ... LLM 调用 + 工具执行 ...
+
+        Args:
+            friend_id: 好友账户 ID
+
+        Returns:
+            True 表示用户已请求取消
+        """
+        return self._stream_cancelled.get(friend_id, False)
+
+    def clear_stream_cancel(self, friend_id: str) -> None:
+        """清除取消标记。
+
+        通常在处理完取消逻辑后调用（发送完 stream_end 之后）。
+
+        Args:
+            friend_id: 好友账户 ID
+        """
+        self._stream_cancelled.pop(friend_id, None)
 
     async def get_group_messages(
         self, group_id: str, limit: int = 50, before: str = ""
