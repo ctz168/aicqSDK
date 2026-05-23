@@ -879,8 +879,6 @@ class AICQCore:
         """
         self._stream_cancelled.pop(friend_id, None)
 
-=======
->>>>>>> main
     async def get_group_messages(
         self, group_id: str, limit: int = 50, before: str = ""
     ) -> List[Dict[str, Any]]:
