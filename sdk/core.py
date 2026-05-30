@@ -962,21 +962,30 @@ class AICQCore:
     # ─── 临时房间 ───────────────────────────────────────────────
 
     async def join_ephemeral_room(
-        self, invite_code: str, display_name: str
+        self, invite_code: str, display_name: str, private_key: str = ""
     ) -> Dict[str, Any]:
         """加入临时房间（无需注册）。
+
+        如果提供 ``private_key``，将尝试复用已有身份，
+        避免创建新的临时成员。服务端会在 /api/v1/ephemeral/join
+        中验证 private_key 并返回已有身份信息。
 
         Args:
             invite_code: 邀请码
             display_name: 在房间中的显示名称
+            private_key: 之前加入时获得的私钥（可选，用于身份复用）
 
         Returns:
             包含 ephemeral_id, token, room_id 等信息的字典
         """
-        result = await self._http_post("/api/v1/ephemeral/join", {
+        payload = {
             "invite_code": invite_code,
             "display_name": display_name,
-        })
+        }
+        if private_key:
+            payload["private_key"] = private_key
+
+        result = await self._http_post("/api/v1/ephemeral/join", payload)
 
         # 服务器返回: ephemeral_id, token, room_id, room_name, expires_at, members
         ephemeral_id = result.get("ephemeral_id", "")
@@ -987,9 +996,11 @@ class AICQCore:
         members = result.get("members", [])
 
         # 保存临时状态
+        raw_token = result.get("raw_token", token)
         self._ephemeral = {
             "ephemeral_id": ephemeral_id,
             "token": token,
+            "raw_token": raw_token,
             "room_id": room_id,
             "room_name": room_name,
             "display_name": display_name,
@@ -1004,10 +1015,12 @@ class AICQCore:
         return {
             "ephemeral_id": ephemeral_id,
             "token": token,
+            "raw_token": raw_token,
             "room_id": room_id,
             "room_name": room_name,
             "expires_at": expires_at,
             "members": members,
+            "is_rejoin": result.get("is_rejoin", False),
         }
 
     # ─── 回调注册 ───────────────────────────────────────────────

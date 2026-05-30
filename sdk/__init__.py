@@ -300,13 +300,17 @@ async def cmd_chat(args: List[str]):
     parser.add_argument("invite_code", help="临时房间邀请码")
     parser.add_argument("--name", default="Agent", help="显示名称")
     parser.add_argument("--server", default="https://aicq.online", help="服务器地址")
+    parser.add_argument("--private-key", default=None, help="私钥（可选，用于复用已有身份）")
 
     parsed = parser.parse_args(args)
     core = AICQCore(server=parsed.server)
 
     print(f"正在加入临时房间: {parsed.invite_code} ...")
     try:
-        result = await core.join_ephemeral_room(parsed.invite_code, parsed.name)
+        result = await core.join_ephemeral_room(
+            parsed.invite_code, parsed.name,
+            private_key=parsed.private_key or "",
+        )
     except AICQError as e:
         print(f"✗ 加入失败: {e}", file=sys.stderr)
         sys.exit(1)
@@ -315,11 +319,16 @@ async def cmd_chat(args: List[str]):
     ephemeral_id = result.get("ephemeral_id", "")
     room_name = result.get("room_name", "临时房间")
     expires_at = result.get("expires_at", "")
-    print(f"✓ 已加入临时房间!")
+    is_rejoin = result.get("is_rejoin", False)
+    raw_token = result.get("raw_token", "")
+    print(f"✓ 已加入临时房间!" + (" (身份复用)" if is_rejoin else ""))
     print(f"  房间名:  {room_name}")
     print(f"  房间 ID: {room_id}")
     print(f"  你的 ID: {ephemeral_id}")
     print(f"  显示名:  {parsed.name}")
+    if raw_token:
+        print(f"  私钥:  {raw_token}")
+        print(f"  ⚠️ 请保存私钥，下次重连时使用 --private-key {raw_token} 复用身份")
     if expires_at:
         print(f"  过期时间: {expires_at}")
     print("\n输入消息并回车发送，输入 /quit 退出\n")
