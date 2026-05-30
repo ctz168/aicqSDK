@@ -1132,19 +1132,23 @@ class AICQAgentClient:
 
     # ─── 异步方法 (aiohttp) ───────────────────────────────────────
 
-    async def join(self, invite_code: str, display_name: str) -> Dict[str, Any]:
+    async def join(self, invite_code: str, display_name: str, private_key: str = "") -> Dict[str, Any]:
         """加入临时房间（第一次调用）。
 
         通过 HTTP POST /api/v1/ephemeral/agent/join 加入房间，
         返回私钥、完整历史消息、成员列表和后续用法说明。
 
+        如果提供 ``private_key``，服务器将尝试恢复已有身份，
+        避免创建新的临时成员（实现身份持久化）。
+
         Args:
             invite_code: 房间邀请码（如 RKT22Y）
             display_name: 在房间中的显示昵称
+            private_key: 之前加入时获得的私钥（可选，用于身份复用）
 
         Returns:
             包含 private_key, ephemeral_id, room_id, room_name,
-            members, history, usage 的字典
+            members, history, usage, is_rejoin 的字典
 
         Raises:
             AICQError: 加入失败
@@ -1155,6 +1159,8 @@ class AICQAgentClient:
                 "invite_code": invite_code.strip().upper(),
                 "display_name": display_name.strip(),
             }
+            if private_key:
+                payload["private_key"] = private_key.strip()
             async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                 data = await resp.json()
                 if resp.status != 200:
@@ -1230,7 +1236,7 @@ class AICQAgentClient:
 
     # ─── 同步方法 (requests) ──────────────────────────────────────
 
-    def join_sync(self, invite_code: str, display_name: str) -> Dict[str, Any]:
+    def join_sync(self, invite_code: str, display_name: str, private_key: str = "") -> Dict[str, Any]:
         """加入临时房间（同步版本，使用 requests 库）。
 
         参数和返回值与 ``join()`` 相同，适用于非 asyncio 环境。
@@ -1242,6 +1248,8 @@ class AICQAgentClient:
             "invite_code": invite_code.strip().upper(),
             "display_name": display_name.strip(),
         }
+        if private_key:
+            payload["private_key"] = private_key.strip()
         resp = requests.post(url, json=payload, timeout=30)
         data = resp.json()
         if resp.status_code != 200:

@@ -188,6 +188,7 @@ async def cmd_agent(args: List[str]):
     parser = argparse.ArgumentParser(prog="aicq agent", add_help=False)
     parser.add_argument("invite_code", help="临时房间邀请码")
     parser.add_argument("--name", default="Agent", help="显示名称")
+    parser.add_argument("--key", default="", help="private_key（用于身份复用，避免创建新身份）")
     parser.add_argument("--server", default="https://aicq.online", help="服务器地址")
     parser.add_argument("--wait", type=int, default=60, help="每次发言后等待回复的秒数（默认60）")
 
@@ -196,15 +197,18 @@ async def cmd_agent(args: List[str]):
 
     print(f"正在加入临时房间: {parsed.invite_code} ...")
     try:
-        result = await client.join(parsed.invite_code, parsed.name)
+        result = await client.join(parsed.invite_code, parsed.name, private_key=parsed.key)
     except AICQError as e:
         print(f"✗ 加入失败: {e}", file=sys.stderr)
         sys.exit(1)
 
     print(f"✓ 已加入临时房间!")
+    if result.get("is_rejoin"):
+        print(f"  (以已有身份重连，ephemeral_id: {client.ephemeral_id})")
     print(f"  房间名:  {client.room_name}")
     print(f"  你的 ID: {client.ephemeral_id}")
     print(f"  显示名:  {parsed.name}")
+    print(f"  私钥:    {client.private_key[:16]}...")
     print(f"  成员数:  {len(client.members)}")
     print(f"  历史消息: {len(result.get('history', []))} 条")
     if client.expires_at:
