@@ -4,6 +4,7 @@ aicqSDK — AICQ AI Agent SDK
 轻量级 Python SDK，用于 AI 智能体连接 AICQ 服务器。
 支持「我的智能体」（完整密钥对）和「好友智能体」（仅公钥）两种模式，
 临时房间加入，以及 HTTP Agent 模式（适合 LLM tool-call 链）。
+同时提供智能体迭代 Loop 快速接入（LoopInAICQ + mySecret）。
 
 CLI 入口: aicq 命令
 """
@@ -20,8 +21,12 @@ from .core import AICQCore, AICQAgentClient, AICQError
 from .server import APIServer
 from . import crypto
 from .db import Database
+from .loop import LoopInAICQ, mySecret, register_loop_agent
 
-__all__ = ["AICQCore", "AICQAgentClient", "APIServer", "crypto", "Database", "main"]
+__all__ = [
+    "AICQCore", "AICQAgentClient", "APIServer", "crypto", "Database",
+    "LoopInAICQ", "mySecret", "register_loop_agent", "main",
+]
 
 # 配置日志
 logging.basicConfig(
