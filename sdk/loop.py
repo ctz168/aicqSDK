@@ -25,7 +25,7 @@ aicq.loop — 智能体迭代 Loop 快速接入模块
 -----------------
 
 生成私钥二维码图片，AICQ 扫一扫即可绑定主人关系。
-二维码格式：``aicq-master-v1:{signing_sec_hex}:{account_id}``
+二维码格式：``aicq-master-v1:{signing_sec_hex}:{account_id}:{signing_pub_hex}``
 """
 
 from __future__ import annotations
@@ -77,6 +77,11 @@ def _save_identity_to_file(identity: Dict[str, Any]) -> None:
     try:
         with open(IDENTITY_FILE, "w", encoding="utf-8") as f:
             json.dump(identity, f, ensure_ascii=False, indent=2)
+        # 限制文件权限仅所有者可读写（包含私钥）
+        try:
+            os.chmod(IDENTITY_FILE, 0o600)
+        except Exception:
+            pass
         logger.info("身份已保存到: %s", IDENTITY_FILE)
     except Exception as e:
         logger.warning("保存身份文件失败: %s", e)
@@ -135,7 +140,11 @@ def _update_identity_cache(update: Dict[str, Any]) -> None:
 # ─── LoopState — Loop 状态管理 ────────────────────────────────────
 
 class _LoopState:
-    """管理 LoopInAICQ 的连接状态。"""
+    """管理 LoopInAICQ 的连接状态。
+
+    维护注册、登录、主人查找、消息收发等生命周期状态，
+    支持自动 Token 刷新和重连机制。
+    """
 
     def __init__(self, server: str = DEFAULT_SERVER):
         self.server = server.rstrip("/")
@@ -144,16 +153,19 @@ class _LoopState:
         self.refresh_token: Optional[str] = None
         self.master_id: Optional[str] = None  # 主人的账户 ID
         self._session: Optional[aiohttp.ClientSession] = None
-        self._last_msg_time: float = 0  # 上次拉取消息的时间戳
+        self._last_msg_time: str = ""  # 上次拉取消息的 ISO 时间戳（与数据库 created_at 格式一致）
         self._logged_in: bool = False
         self._registered: bool = False
+        self._token_expiry: float = 0  # access_token 过期时间（epoch 秒）
+        self._login_attempts: int = 0  # 连续登录尝试次数（防无限重试）
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
         return self._session
 
-    async def _http_post(self, path: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    async def _http_post(self, path: str, data: Dict[str, Any], _retry: bool = True) -> Dict[str, Any]:
+        """发送 HTTP POST 请求，支持 401 自动重试。"""
         session = await self._get_session()
         url = f"{self.server}{path}"
         headers = {"Content-Type": "application/json"}
@@ -167,11 +179,29 @@ class _LoopState:
                 text = await resp.text()
                 result = {"error": f"非JSON响应 (HTTP {resp.status})", "raw": text[:200]}
 
+            # 401 时尝试自动刷新 token 并重试一次
+            if resp.status == 401 and _retry:
+                logger.info("收到 401，尝试刷新认证...")
+                try:
+                    # 先尝试 refresh token
+                    if self.refresh_token:
+                        await self._refresh_token()
+                    else:
+                        # 没有 refresh token，重新登录
+                        self._logged_in = False
+                        await self.ensure_logged_in()
+                    # 重试请求
+                    return await self._http_post(path, data, _retry=False)
+                except Exception as retry_err:
+                    logger.warning("认证刷新失败: %s", retry_err)
+                    raise Exception(f"HTTP 401: 认证失败且刷新也失败")
+
             if resp.status >= 400:
                 raise Exception(f"HTTP {resp.status}: {result}")
             return result
 
-    async def _http_get(self, path: str) -> Dict[str, Any]:
+    async def _http_get(self, path: str, _retry: bool = True) -> Dict[str, Any]:
+        """发送 HTTP GET 请求，支持 401 自动重试。"""
         session = await self._get_session()
         url = f"{self.server}{path}"
         headers = {}
@@ -185,9 +215,42 @@ class _LoopState:
                 text = await resp.text()
                 result = {"error": f"非JSON响应 (HTTP {resp.status})", "raw": text[:200]}
 
+            if resp.status == 401 and _retry:
+                logger.info("GET 收到 401，尝试刷新认证...")
+                try:
+                    if self.refresh_token:
+                        await self._refresh_token()
+                    else:
+                        self._logged_in = False
+                        await self.ensure_logged_in()
+                    return await self._http_get(path, _retry=False)
+                except Exception as retry_err:
+                    logger.warning("认证刷新失败: %s", retry_err)
+                    raise Exception(f"HTTP 401: 认证失败且刷新也失败")
+
             if resp.status >= 400:
                 raise Exception(f"HTTP {resp.status}: {result}")
             return result
+
+    async def _refresh_token(self) -> None:
+        """刷新 access_token。"""
+        if not self.refresh_token:
+            raise Exception("没有 refresh_token")
+
+        session = await self._get_session()
+        url = f"{self.server}/api/v1/auth/refresh"
+        async with session.post(url, json={"refresh_token": self.refresh_token}) as resp:
+            try:
+                data = await resp.json()
+            except Exception:
+                raise Exception(f"Token 刷新返回非JSON (HTTP {resp.status})")
+            if resp.status >= 400:
+                raise Exception(f"Token 刷新失败: HTTP {resp.status}: {data}")
+
+        self.access_token = data.get("access_token") or data.get("accessToken")
+        self.refresh_token = data.get("refresh_token") or data.get("refreshToken", self.refresh_token)
+        self._token_expiry = time.time() + 3600  # 假设1小时过期
+        logger.info("Token 已刷新")
 
     async def ensure_registered(self) -> None:
         """确保智能体已注册到 AICQ 服务器。"""
@@ -215,6 +278,7 @@ class _LoopState:
                 self.access_token = result["access_token"]
                 self.refresh_token = result.get("refresh_token", "")
                 self._logged_in = True
+                self._token_expiry = time.time() + 3600
 
             if account_id:
                 _update_identity_cache({"account_id": account_id})
@@ -238,12 +302,28 @@ class _LoopState:
                 logger.error("查找也失败: %s", e2)
 
     async def ensure_logged_in(self) -> None:
-        """确保智能体已登录。"""
-        if self._logged_in and self.access_token:
+        """确保智能体已登录。支持自动重试和 token 刷新。"""
+        # 已登录且 token 未过期
+        if self._logged_in and self.access_token and time.time() < self._token_expiry:
             return
+
+        # 尝试先刷新 token
+        if self._logged_in and self.refresh_token and self.access_token:
+            try:
+                await self._refresh_token()
+                return
+            except Exception as e:
+                logger.warning("Token 刷新失败，重新登录: %s", e)
+                self._logged_in = False
 
         if not self.identity or not self.identity.get("signing_sec"):
             raise Exception("无法登录：缺少私钥")
+
+        # 防止无限重试
+        self._login_attempts += 1
+        if self._login_attempts > 5:
+            self._login_attempts = 0
+            raise Exception("登录重试次数过多，请检查网络或服务器状态")
 
         signing_pub = self.identity["signing_pub"]
         signing_sec = self.identity["signing_sec"]
@@ -252,7 +332,7 @@ class _LoopState:
         try:
             challenge_resp = await self._http_post("/api/v1/auth/challenge", {
                 "public_key": signing_pub,
-            })
+            }, _retry=False)
         except Exception as e:
             raise Exception(f"获取挑战失败: {e}")
 
@@ -269,7 +349,7 @@ class _LoopState:
                 "public_key": signing_pub,
                 "signature": signature,
                 "challenge": challenge,
-            })
+            }, _retry=False)
         except Exception as e:
             raise Exception(f"登录失败: {e}")
 
@@ -280,6 +360,8 @@ class _LoopState:
             raise Exception("登录响应中未包含 access_token")
 
         self._logged_in = True
+        self._token_expiry = time.time() + 3600  # 1小时过期
+        self._login_attempts = 0  # 重置计数器
         logger.info("智能体已登录: %s", self.identity.get("account_id", "?")[:16])
 
     async def find_master(self) -> Optional[str]:
@@ -308,11 +390,19 @@ class _LoopState:
         return None
 
     async def send_to_master(self, content: str) -> None:
-        """发送消息给主人。通过 HTTP API 发送。"""
+        """发送消息给主人。通过 HTTP API 发送。
+
+        优先使用专用的 /api/v1/agent/loopMessage 端点；
+        如失败则尝试通过标准消息 API 发送。
+        """
         master_id = await self.find_master()
         if not master_id:
             logger.debug("尚未绑定主人，跳过发送")
             return
+
+        # 截断过长内容（避免超出 HTTP body 限制）
+        if len(content) > 10000:
+            content = content[:9900] + "\n... (内容过长已截断)"
 
         try:
             await self._http_post("/api/v1/agent/loopMessage", {
@@ -322,33 +412,57 @@ class _LoopState:
                 "msg_type": "text",
             })
         except Exception as e:
-            # 如果服务器不支持 loopMessage 端点，尝试通过 WS 或其他方式
-            logger.warning("发送消息给主人失败: %s", e)
+            logger.warning("loopMessage 发送失败: %s，尝试标准消息 API", e)
+            # 回退到标准消息端点
+            try:
+                await self._http_post("/api/v1/friends/message", {
+                    "to_id": master_id,
+                    "content": content,
+                    "type": "text",
+                })
+            except Exception as e2:
+                logger.warning("标准消息 API 也失败: %s", e2)
 
     async def poll_master_messages(self) -> str:
-        """从主人获取新消息。"""
+        """从主人获取新消息。
+
+        时间戳处理：服务器使用 ISO 格式字符串作为 created_at，
+        本模块也使用 ISO 格式字符串来跟踪上次拉取位置，确保类型一致。
+        首次拉取时 _last_msg_time 为空字符串，获取最近 20 条消息。
+        后续拉取只获取上次时间戳之后的新消息。
+        """
         master_id = await self.find_master()
         if not master_id:
             return ""
 
         try:
-            result = await self._http_post("/api/v1/agent/loopPoll", {
+            payload: Dict[str, Any] = {
                 "agent_public_key": self.identity["signing_pub"],
-                "since": self._last_msg_time,
-            })
+            }
+            # 只在有上次拉取时间时才发送 since 参数
+            if self._last_msg_time:
+                payload["since"] = self._last_msg_time
+
+            result = await self._http_post("/api/v1/agent/loopPoll", payload)
             messages = result.get("messages", [])
             if messages:
                 # 提取消息内容
                 contents = []
+                latest_time = self._last_msg_time
                 for msg in messages:
                     content = msg.get("content", "")
                     from_id = msg.get("from_id", "")
+                    msg_time = msg.get("timestamp", "")  # ISO 格式字符串
+
                     if from_id == master_id and content:
                         contents.append(content)
-                    # 更新最新时间
-                    msg_time = msg.get("timestamp", 0)
-                    if isinstance(msg_time, (int, float)) and msg_time > self._last_msg_time:
-                        self._last_msg_time = msg_time
+
+                    # 更新最新时间（ISO 字符串按字典序比较即可）
+                    if msg_time and (not latest_time or msg_time > latest_time):
+                        latest_time = msg_time
+
+                if latest_time:
+                    self._last_msg_time = latest_time
 
                 if contents:
                     return "\n".join(contents)
@@ -359,6 +473,7 @@ class _LoopState:
             return ""
 
     async def close(self) -> None:
+        """关闭 HTTP 会话。"""
         if self._session and not self._session.closed:
             await self._session.close()
             self._session = None
@@ -438,13 +553,13 @@ def mySecret(
 ) -> Dict[str, Any]:
     """生成私钥二维码图片，用于 AICQ 扫一扫绑定主人。
 
-    生成包含 ``aicq-master-v1:{signing_sec}:{account_id}`` 格式的二维码，
+    生成包含 ``aicq-master-v1:{signing_sec}:{account_id}:{signing_pub}`` 格式的二维码，
     AICQ 客户端扫描后自动绑定主人关系。
 
     Args:
         output_dir: 二维码图片保存目录
         server: AICQ 服务器地址（仅记录，不用于网络请求）
-        agent_name: 智能体名称（可选，用于文件名）
+        agent_name: 智能体名称（可选，用于文件名和二维码标注）
 
     Returns:
         包含以下键的字典:
@@ -452,6 +567,7 @@ def mySecret(
         - ``public_key``: 智能体公钥
         - ``account_id``: 智能体账户 ID（可能为空，需先注册）
         - ``qr_content``: 二维码内容
+        - ``fingerprint``: 公钥指纹
     """
     import qrcode
 
@@ -463,9 +579,9 @@ def mySecret(
     account_id = identity.get("account_id", "")
 
     # 2. 构建二维码内容
-    #    格式: aicq-master-v1:{signing_sec_hex}:{account_id}
+    #    格式: aicq-master-v1:{signing_sec_hex}:{account_id}:{signing_pub_hex}
     #    扫码时，AICQ 客户端解析此格式，自动：
-    #    - 通过 signing_sec 派生 signing_pub 验证身份
+    #    - 通过 signing_pub 验证身份
     #    - 将扫码者设为该智能体的主人
     qr_content = f"aicq-master-v1:{signing_sec}:{account_id}:{signing_pub}"
 
@@ -491,44 +607,50 @@ def mySecret(
     from PIL import Image, ImageDraw, ImageFont
 
     img = img.convert("RGB")
-    draw = ImageDraw.Draw(img)
 
-    # 添加底部空间
+    # 添加底部空间（增加高度以容纳中英文文字）
     width, height = img.size
-    new_height = height + 60
+    new_height = height + 80
     new_img = Image.new("RGB", (width, new_height), "#FAF9F6")
     new_img.paste(img, (0, 0))
 
-    # 绘制文字
     draw = ImageDraw.Draw(new_img)
+
+    # 第一行：智能体名称 + 账户ID
     label = f"AICQ Agent: {name_part}"
     if account_id:
         label += f" | ID: {account_id}"
 
-    try:
-        # 尝试使用系统字体
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
-    except Exception:
-        font = ImageFont.load_default()
+    # 尝试加载支持中文的字体
+    font = _load_font(14)
+    hint_font = _load_font(11)
 
     bbox = draw.textbbox((0, 0), label, font=font)
     text_width = bbox[2] - bbox[0]
     text_x = (width - text_width) // 2
-    draw.text((text_x, height + 10), label, fill="#2D2A26", font=font)
+    draw.text((text_x, height + 8), label, fill="#2D2A26", font=font)
 
-    # 第二行提示
-    hint = "Scan in AICQ to bind as master"
-    try:
-        hint_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 11)
-    except Exception:
-        hint_font = ImageFont.load_default()
-
+    # 第二行提示（中英双语）
+    hint = "AICQ 扫一扫绑定主人 | Scan to bind as master"
     bbox2 = draw.textbbox((0, 0), hint, font=hint_font)
     hint_width = bbox2[2] - bbox2[0]
     hint_x = (width - hint_width) // 2
-    draw.text((hint_x, height + 32), hint, fill="#9B958E", font=hint_font)
+    draw.text((hint_x, height + 30), hint, fill="#9B958E", font=hint_font)
+
+    # 第三行：服务器地址
+    server_hint = f"Server: {server}"
+    bbox3 = draw.textbbox((0, 0), server_hint, font=hint_font)
+    server_width = bbox3[2] - bbox3[0]
+    server_x = (width - server_width) // 2
+    draw.text((server_x, height + 50), server_hint, fill="#B8B2AA", font=hint_font)
 
     new_img.save(qr_path, "PNG")
+
+    # 限制二维码文件权限
+    try:
+        os.chmod(qr_path, 0o600)
+    except Exception:
+        pass
 
     result = {
         "qr_path": os.path.abspath(qr_path),
@@ -545,12 +667,30 @@ def mySecret(
     print(f"  公钥:     {signing_pub[:32]}...")
     print(f"  指纹:     {result['fingerprint']}")
     print(f"  账户 ID:  {account_id or '(需先注册)'}")
+    print(f"  服务器:   {server}")
     print(f"  二维码:   {os.path.abspath(qr_path)}")
     print(f"{'='*50}")
     print(f"  请在 AICQ 中扫一扫此二维码绑定主人")
     print(f"{'='*50}\n")
 
     return result
+
+
+def _load_font(size: int):
+    """加载合适的字体，优先支持中文的字体。"""
+    from PIL import ImageFont as _ImageFont
+
+    font_paths = [
+        "/usr/share/fonts/truetype/chinese/NotoSansSC[wght].ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    ]
+    for path in font_paths:
+        try:
+            return _ImageFont.truetype(path, size)
+        except Exception:
+            continue
+    return _ImageFont.load_default()
 
 
 async def register_loop_agent(server: str = DEFAULT_SERVER) -> Dict[str, Any]:

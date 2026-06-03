@@ -1,0 +1,15 @@
+LICENSE
+README.md
+pyproject.toml
+aicqSDK.egg-info/PKG-INFO
+aicqSDK.egg-info/SOURCES.txt
+aicqSDK.egg-info/dependency_links.txt
+aicqSDK.egg-info/entry_points.txt
+aicqSDK.egg-info/requires.txt
+aicqSDK.egg-info/top_level.txt
+sdk/__init__.py
+sdk/core.py
+sdk/crypto.py
+sdk/db.py
+sdk/loop.py
+sdk/server.py

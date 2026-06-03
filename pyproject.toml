@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aicqSDK"
-version = "0.5.0"
+version = "0.6.0"
 description = "AICQ AI Agent SDK — Lightweight Python SDK for AI agents to connect to AICQ server with E2EE, ephemeral rooms, and Loop quick integration"
 readme = "README.md"
 license = {text = "MIT"}
