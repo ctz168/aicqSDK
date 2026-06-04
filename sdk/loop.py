@@ -370,7 +370,7 @@ class _LoopState:
             return self.master_id
 
         try:
-            result = await self._http_get("/api/v1/friends/")
+            result = await self._http_get("/api/v1/friends")
             friends = result.get("friends", [])
             if friends:
                 # 优先选择 human 类型的好友
