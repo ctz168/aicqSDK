@@ -1079,6 +1079,170 @@ class AICQCore:
             "server": self.server,
         }
 
+    # ─── 临时码 ─────────────────────────────────────────────────
+
+    async def generate_temp_number(self) -> Dict[str, Any]:
+        """生成6位临时码。
+
+        生成一个6位数字临时码，其他用户可通过此码添加你为好友。
+        临时码有效期为24小时，每次生成会覆盖之前的码。
+
+        Returns:
+            包含临时码信息的字典，例如:
+            ``{"number": "123456", "expires_at": "2024-01-01T00:00:00Z"}``
+        """
+        return await self._http_post("/api/v1/temp-number", {})
+
+    async def resolve_temp_number(self, number: str) -> Dict[str, Any]:
+        """解析6位临时码，获取对应用户信息。
+
+        Args:
+            number: 6位临时码，如 "123456"
+
+        Returns:
+            包含用户信息的字典，例如:
+            ``{"id": "4622ca50...", "display_name": "小助手", "type": "agent"}``
+        """
+        return await self._http_get(f"/api/v1/temp-number/{number}")
+
+    async def revoke_temp_number(self, number: str) -> bool:
+        """撤销6位临时码。
+
+        Args:
+            number: 要撤销的6位临时码
+
+        Returns:
+            是否撤销成功
+        """
+        try:
+            session = await self._get_session()
+            url = f"{self.server}/api/v1/temp-number/{number}"
+            headers = {}
+            if self.access_token:
+                headers["Authorization"] = f"Bearer {self.access_token}"
+            async with session.delete(url, headers=headers) as resp:
+                return resp.status < 400
+        except Exception as e:
+            logger.warning("撤销临时码失败: %s", e)
+            return False
+
+    # ─── 文件发送 ──────────────────────────────────────────────
+
+    async def upload_file(self, file_path: str, mime_type: str = "") -> Dict[str, Any]:
+        """上传文件到服务器。
+
+        上传文件后，需要通过 :meth:`send_file_message` 将文件信息发送给好友。
+
+        Args:
+            file_path: 本地文件路径
+            mime_type: MIME 类型（可选，自动检测）
+
+        Returns:
+            包含文件信息的字典，例如:
+            ``{"id": "xxx", "url": "/api/v1/chat/files/xxx", "size": 1234, "mimeType": "image/png"}``
+        """
+        import os
+        import mimetypes
+
+        if not os.path.isfile(file_path):
+            raise AICQError(f"文件不存在: {file_path}")
+
+        filename = os.path.basename(file_path)
+        if not mime_type:
+            mime_type, _ = mimetypes.guess_type(file_path)
+            if not mime_type:
+                mime_type = "application/octet-stream"
+
+        session = await self._get_session()
+        url = f"{self.server}/api/v1/chat/upload"
+        headers = {}
+        if self.access_token:
+            headers["Authorization"] = f"Bearer {self.access_token}"
+
+        data = aiohttp.FormData()
+        data.add_field(
+            "file",
+            open(file_path, "rb"),
+            filename=filename,
+            content_type=mime_type,
+        )
+
+        async with session.post(url, data=data, headers=headers) as resp:
+            result = await self._safe_json(resp)
+            if resp.status >= 400:
+                raise AICQError(f"文件上传失败 HTTP {resp.status}: {result}")
+            return result
+
+    async def send_file_message(self, friend_id: str, file_info: Dict[str, Any]):
+        """发送文件消息给好友。
+
+        需要先调用 :meth:`upload_file` 获取 file_info，再调用此方法发送。
+
+        Args:
+            friend_id: 好友账户 ID
+            file_info: :meth:`upload_file` 返回的文件信息字典
+        """
+        if self.ws is None or self.ws.closed:
+            raise AICQConnectionError("WebSocket 未连接")
+
+        agent = self._agent or self.db.get_agent()
+        if agent is None:
+            raise AICQError("没有可用的智能体")
+
+        import uuid as _uuid
+        mime_type = file_info.get("mimeType", "application/octet-stream")
+        is_image = mime_type.startswith("image/")
+        msg_type = "image" if is_image else "file"
+
+        file_content = json.dumps({
+            "file_id": file_info.get("id", ""),
+            "url": file_info.get("url", ""),
+            "filename": file_info.get("filename", ""),
+            "size": file_info.get("size", 0),
+            "mime_type": mime_type,
+            "thumb_url": file_info.get("thumbUrl", ""),
+        })
+
+        msg_obj = {
+            "id": f"msg_{int(time.time() * 1000)}_{_uuid.uuid4().hex[:8]}",
+            "from_id": agent["account_id"],
+            "to_id": friend_id,
+            "type": msg_type,
+            "content": file_content,
+            "media_url": file_info.get("url", ""),
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+            "status": "sent",
+        }
+        msg = {
+            "type": "message",
+            "to": friend_id,
+            "data": msg_obj,
+        }
+        await self.ws.send_json(msg)
+
+        # 保存到本地记录
+        self.db.save_message(
+            agent_id=agent["account_id"],
+            chat_id=friend_id,
+            is_group=False,
+            from_id=agent["account_id"],
+            content=file_content,
+            msg_type=msg_type,
+        )
+
+    async def send_file(self, friend_id: str, file_path: str, mime_type: str = ""):
+        """上传文件并发送给好友（一步完成）。
+
+        这是 :meth:`upload_file` + :meth:`send_file_message` 的快捷方法。
+
+        Args:
+            friend_id: 好友账户 ID
+            file_path: 本地文件路径
+            mime_type: MIME 类型（可选，自动检测）
+        """
+        file_info = await self.upload_file(file_path, mime_type)
+        await self.send_file_message(friend_id, file_info)
+
     # ─── 清理 ───────────────────────────────────────────────────
 
     async def close(self):

@@ -1,0 +1,37 @@
+# 工作流: 自动构建并发布 aicqSDK 到 PyPI
+# 当 ctz168/aicqSDK 公开仓库的 main 分支收到推送时，
+# 使用 Trusted Publisher (OIDC) 自动发布到 PyPI
+name: Publish to PyPI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'aicq/**'
+      - 'pyproject.toml'
+  workflow_dispatch:
+
+jobs:
+  publish:
+    name: Build & Publish to PyPI
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # Required for Trusted Publisher
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: pip install build
+
+      - name: Build package
+        run: python -m build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
