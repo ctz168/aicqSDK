@@ -21,11 +21,12 @@ from .core import AICQCore, AICQAgentClient, AICQError
 from .server import APIServer
 from . import crypto
 from .db import Database
-from .loop import startLoop, mySecret, register_loop_agent
+from .loop import startLoop, mySecret, register_loop_agent, LoopContext, loop_send_file, loop_upload_file, loop_send_message, get_loop_context
 
 __all__ = [
     "AICQCore", "AICQAgentClient", "APIServer", "crypto", "Database",
     "startLoop", "mySecret", "register_loop_agent", "main",
+    "LoopContext", "loop_send_file", "loop_upload_file", "loop_send_message", "get_loop_context",
 ]
 
 # 配置日志

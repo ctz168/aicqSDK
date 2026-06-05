@@ -232,4 +232,3 @@ aicqSDK/
 - **sessions** — 会话密钥
 - **chat_history** — 聊天记录
 - **loop/identity.json** — Loop 智能体的密钥对和账户信息
-# aicqSDK v0.8.2

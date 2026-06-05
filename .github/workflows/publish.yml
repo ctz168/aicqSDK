@@ -1,12 +1,11 @@
-# 工作流: 自动构建并发布 aicqSDK 到 PyPI
-# 当 ctz168/aicqSDK 公开仓库的 main 分支收到推送时，
-# 使用 PyPI API Token 自动发布到 PyPI
+# 公开仓 aicqSDK 自动替换连接地址 + 发布到 PyPI
+# 使用 Trusted Publisher OIDC，无需存储任何 Token
 #
-# 需要在 GitHub 仓库 Settings > Secrets 中配置:
-#   PYPI_API_TOKEN — PyPI API Token (从 https://pypi.org/manage/account/token/ 获取)
-#
-# 未来可切换为 Trusted Publisher 模式（需在 PyPI 上预先配置）
-name: Publish to PyPI
+# PyPI Trusted Publisher 配置:
+#   Repository: ctz168/aicqSDK
+#   Workflow: publish.yml
+#   Environment: pypi
+name: Build and Publish aicqSDK
 
 on:
   push:
@@ -17,12 +16,15 @@ on:
   workflow_dispatch:
 
 jobs:
-  publish:
-    name: Build & Publish to PyPI
+  build-and-publish:
     runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+      contents: read
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -30,13 +32,29 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Replace URLs for public repo
+        run: |
+          echo "=== 替换 pyproject.toml 中的 URL ==="
+          sed -i 's|Repository = "https://github.com/ctz168/aicq"|Repository = "https://github.com/ctz168/aicqSDK"|g' pyproject.toml
+          sed -i 's|Issues = "https://github.com/ctz168/aicq/issues"|Issues = "https://github.com/ctz168/aicqSDK/issues"|g' pyproject.toml
+          echo "=== 替换后的 pyproject.toml ==="
+          cat pyproject.toml
+
+      - name: Verify server URLs point to aicq.online
+        run: |
+          echo "=== 验证 SDK 默认连接地址 ==="
+          grep -rn "acer.tunnel" aicq/ && echo "ERROR: 发现测试服务器地址!" && exit 1 || echo "OK: 无测试服务器地址"
+
       - name: Install build tools
-        run: pip install build
+        run: |
+          python -m pip install --upgrade pip
+          pip install build
 
       - name: Build package
-        run: python -m build
+        run: |
+          python -m build
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          password: ${{ secrets.PYPI_API_TOKEN }}
+          attestations: true

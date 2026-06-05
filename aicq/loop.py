@@ -65,6 +65,7 @@ import time
 import logging
 import uuid as _uuid
 from collections import OrderedDict
+import mimetypes as _mimetypes
 from typing import Optional, Dict, Any, Callable, Awaitable
 
 import aiohttp
@@ -86,6 +87,221 @@ PING_INTERVAL = 30
 # 重连间隔（秒），指数退避
 RECONNECT_BASE_DELAY = 2
 RECONNECT_MAX_DELAY = 60
+
+
+# ─── Loop 上下文 — 供 on_message 回调中调用高级功能 ──────────────
+
+class LoopContext:
+    """startLoop 运行时上下文，提供发文件、主动发消息等高级 API。
+
+    当 ``startLoop`` 的 ``on_message`` 回调签名为三个参数时，
+    第三个参数就是 ``LoopContext`` 实例::
+
+        async def on_message(content, from_id, ctx: LoopContext):
+            # 主动发文件
+            await ctx.send_file(from_id, "/path/to/file.png")
+            return None  # 已自行回复，不再自动回复
+
+    也可在回调外部通过模块级函数使用::
+
+        from aicq.loop import loop_send_file
+        await loop_send_file(friend_id, "/path/to/file.png")
+    """
+
+    def __init__(self):
+        self.ws: Optional[aiohttp.ClientWebSocketResponse] = None
+        self.access_token: Optional[str] = None
+        self.server: str = DEFAULT_SERVER
+        self.identity: Optional[Dict[str, Any]] = None
+
+    # ─── 文件操作 ──────────────────────────────────────────────
+
+    async def upload_file(self, file_path: str, mime_type: str = "") -> Dict[str, Any]:
+        """上传文件到 AICQ 服务器。
+
+        Args:
+            file_path: 本地文件路径
+            mime_type: MIME 类型（可选，自动检测）
+
+        Returns:
+            包含文件信息的字典，例如:
+            ``{"id": "xxx", "url": "/api/v1/chat/files/xxx", "size": 1234, "mimeType": "image/png"}``
+        """
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"文件不存在: {file_path}")
+
+        filename = os.path.basename(file_path)
+        if not mime_type:
+            mime_type, _ = _mimetypes.guess_type(file_path)
+            if not mime_type:
+                mime_type = "application/octet-stream"
+
+        url = f"{self.server}/api/v1/chat/upload"
+        headers = {}
+        if self.access_token:
+            headers["Authorization"] = f"Bearer {self.access_token}"
+
+        data = aiohttp.FormData()
+        data.add_field(
+            "file",
+            open(file_path, "rb"),
+            filename=filename,
+            content_type=mime_type,
+        )
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, data=data, headers=headers) as resp:
+                try:
+                    result = await resp.json()
+                except Exception:
+                    text = await resp.text()
+                    result = {"error": f"非JSON响应 (HTTP {resp.status})", "raw": text[:200]}
+                if resp.status >= 400:
+                    raise Exception(f"文件上传失败 HTTP {resp.status}: {result}")
+                return result
+
+    async def send_file_message(self, friend_id: str, file_info: Dict[str, Any]):
+        """发送文件消息给好友（需先 upload_file 获取 file_info）。
+
+        Args:
+            friend_id: 好友账户 ID
+            file_info: upload_file 返回的文件信息字典
+        """
+        if self.ws is None or self.ws.closed:
+            raise ConnectionError("WebSocket 未连接")
+        if self.identity is None:
+            raise RuntimeError("身份未初始化")
+
+        mime_type = file_info.get("mimeType", "application/octet-stream")
+        is_image = mime_type.startswith("image/")
+        msg_type = "image" if is_image else "file"
+
+        file_content = json.dumps({
+            "file_id": file_info.get("id", ""),
+            "url": file_info.get("url", ""),
+            "filename": file_info.get("filename", ""),
+            "size": file_info.get("size", 0),
+            "mime_type": mime_type,
+            "thumb_url": file_info.get("thumbUrl", ""),
+        })
+
+        msg_obj = {
+            "id": f"msg_{int(time.time() * 1000)}_{_uuid.uuid4().hex[:8]}",
+            "from_id": self.identity["account_id"],
+            "to_id": friend_id,
+            "type": msg_type,
+            "content": file_content,
+            "media_url": file_info.get("url", ""),
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+            "status": "sent",
+        }
+        msg = {
+            "type": "message",
+            "to": friend_id,
+            "data": msg_obj,
+        }
+        await self.ws.send_json(msg)
+        logger.info("文件消息已发送给 %s: %s (%s)", friend_id[:16], msg_type, file_info.get("size", 0))
+
+    async def send_file(self, friend_id: str, file_path: str, mime_type: str = ""):
+        """上传文件并发送给好友（一步完成）。
+
+        这是 upload_file + send_file_message 的快捷方法。
+
+        Args:
+            friend_id: 好友账户 ID
+            file_path: 本地文件路径
+            mime_type: MIME 类型（可选，自动检测）
+        """
+        file_info = await self.upload_file(file_path, mime_type)
+        await self.send_file_message(friend_id, file_info)
+
+    # ─── 主动发消息 ─────────────────────────────────────────────
+
+    async def send_message(self, friend_id: str, content: str):
+        """主动发送文本消息给好友（不受 on_message 返回值限制）。
+
+        Args:
+            friend_id: 好友账户 ID
+            content: 消息内容
+        """
+        if self.ws is None or self.ws.closed:
+            raise ConnectionError("WebSocket 未连接")
+        if self.identity is None:
+            raise RuntimeError("身份未初始化")
+
+        msg_obj = {
+            "id": f"msg_{int(time.time() * 1000)}_{_uuid.uuid4().hex[:8]}",
+            "from_id": self.identity["account_id"],
+            "to_id": friend_id,
+            "type": "text",
+            "content": content,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+            "status": "sent",
+        }
+        msg = {
+            "type": "message",
+            "to": friend_id,
+            "data": msg_obj,
+        }
+        await self.ws.send_json(msg)
+
+
+# 模块级 LoopContext 单例，供外部通过 loop_send_file 等函数使用
+_loop_ctx = LoopContext()
+
+
+# ─── 模块级便捷函数 ──────────────────────────────────────────────
+
+def get_loop_context() -> LoopContext:
+    """获取当前 startLoop 的运行时上下文。
+
+    在 startLoop 运行期间可调用，获取 LoopContext 以使用高级 API。
+
+    典型用法::
+
+        from aicq import get_loop_context
+
+        ctx = get_loop_context()
+        await ctx.send_file(friend_id, "/path/to/file.png")
+    """
+    return _loop_ctx
+
+
+async def loop_send_file(friend_id: str, file_path: str, mime_type: str = ""):
+    """上传文件并发送给好友（模块级快捷函数）。
+
+    在 startLoop 运行期间调用。使用当前 startLoop 的 WS 连接和认证状态。
+
+    Args:
+        friend_id: 好友账户 ID
+        file_path: 本地文件路径
+        mime_type: MIME 类型（可选，自动检测）
+    """
+    await _loop_ctx.send_file(friend_id, file_path, mime_type)
+
+
+async def loop_upload_file(file_path: str, mime_type: str = "") -> Dict[str, Any]:
+    """上传文件到服务器（模块级快捷函数）。
+
+    Args:
+        file_path: 本地文件路径
+        mime_type: MIME 类型（可选，自动检测）
+
+    Returns:
+        包含文件信息的字典
+    """
+    return await _loop_ctx.upload_file(file_path, mime_type)
+
+
+async def loop_send_message(friend_id: str, content: str):
+    """主动发送文本消息给好友（模块级快捷函数）。
+
+    Args:
+        friend_id: 好友账户 ID
+        content: 消息内容
+    """
+    await _loop_ctx.send_message(friend_id, content)
 
 
 # ─── 消息去重 LRU 缓存 ────────────────────────────────────────────
@@ -320,7 +536,7 @@ async def _login(
 # ─── startLoop — WebSocket 实时模式 ──────────────────────────────
 
 async def startLoop(
-    on_message: Callable[[str, str], Awaitable[Optional[str]]],
+    on_message: Callable[..., Awaitable[Optional[str]]],
     identity: Optional[Dict[str, Any]] = None,
     public_key: str = "",
     server: str = DEFAULT_SERVER,
@@ -361,6 +577,12 @@ async def startLoop(
     高级用法
     ~~~~~~~~
 
+    发送文件 — 回调签名加第三个参数 ``ctx`` (LoopContext)::
+
+        async def on_message(content, from_id, ctx):
+            await ctx.send_file(from_id, "/path/to/image.png")
+            return "文件已发送！"
+
     支持群组消息回调::
 
         async def on_group_msg(content, from_id, group_id):
@@ -376,10 +598,10 @@ async def startLoop(
         asyncio.run(startLoop(on_message, on_error=on_error))
 
     Args:
-        on_message: 异步回调函数，签名 ``async def on_message(content: str, from_id: str) -> str|None``
-            - content: 收到的消息内容
-            - from_id: 发送者的账户 ID
-            - 返回字符串则自动回复，返回 None 则不回复
+        on_message: 异步回调函数，支持两种签名:
+            - 两参数: ``async def on_message(content: str, from_id: str) -> str|None``
+            - 三参数: ``async def on_message(content: str, from_id: str, ctx: LoopContext) -> str|None``
+            当签名为三参数时，``ctx`` 提供 ``send_file()`` / ``upload_file()`` / ``send_message()`` 等高级 API
         identity: 智能体身份字典（为空则自动管理，首次运行自动创建）。
             格式：{account_id, signing_pub, signing_sec, exchange_pub, exchange_sec}
         public_key: 智能体公钥（identity 和 public_key 都为空则自动管理）
@@ -394,6 +616,14 @@ async def startLoop(
         如果需要后台运行，可使用 ``asyncio.create_task(startLoop(...))``。
     """
     server = server.rstrip("/")
+
+    # ── 检测 on_message 回调是否接受 ctx 参数 ──
+    import inspect as _inspect
+    try:
+        sig = _inspect.signature(on_message)
+        _callback_has_ctx = len(sig.parameters) >= 3
+    except Exception:
+        _callback_has_ctx = False
 
     # ── 1. 加载或创建身份 ──
     if identity:
@@ -453,6 +683,13 @@ async def startLoop(
                 await ws.send_json(online_msg)
                 logger.info("已发送 online 消息，智能体上线: %s", identity["account_id"])
 
+                # ── 同步状态到模块级 LoopContext ──
+                global _loop_ctx
+                _loop_ctx.ws = ws
+                _loop_ctx.access_token = access_token
+                _loop_ctx.server = server
+                _loop_ctx.identity = identity
+
                 # 重置重连延迟
                 reconnect_delay = RECONNECT_BASE_DELAY
 
@@ -491,7 +728,10 @@ async def startLoop(
 
                                 if content and from_id:
                                     try:
-                                        reply = await on_message(content, from_id)
+                                        if _callback_has_ctx:
+                                            reply = await on_message(content, from_id, _loop_ctx)
+                                        else:
+                                            reply = await on_message(content, from_id)
                                         if reply and isinstance(reply, str):
                                             reply_msg = {
                                                 "type": "message",
