@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aicqSDK"
-version = "0.9.0"
-description = "AICQ AI Agent SDK — Lightweight Python SDK for AI agents to connect to AICQ server via WebSocket real-time mode (startLoop), E2EE, ephemeral rooms, stream output, temp numbers, file transfer, and LoopContext"
+version = "0.8.2"
+description = "AICQ AI Agent SDK — Lightweight Python SDK for AI agents to connect to AICQ server via WebSocket real-time mode (startLoop), E2EE, ephemeral rooms, stream output, temp numbers, and file transfer"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"

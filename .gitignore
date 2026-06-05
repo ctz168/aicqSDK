@@ -1,1 +1,10 @@
-aicqSDK/build/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.env
+*.db
+*.db-shm
+*.db-wal

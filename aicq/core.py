@@ -1128,21 +1128,29 @@ class AICQCore:
 
     # ─── 文件发送 ──────────────────────────────────────────────
 
-    async def upload_file(self, file_path: str, mime_type: str = "") -> Dict[str, Any]:
-        """上传文件到服务器。
+    async def upload_file(self, file_path: str, mime_type: str = "", p2p: bool = False, friend_id: str = "") -> Dict[str, Any]:
+        """上传文件到服务器，或以 P2P 模式准备文件数据。
+
+        当 ``p2p=True`` 且文件较小（<= 2MB）时，文件将以 base64 方式通过 WS 直传，
+        不占用服务器存储和带宽。此时返回的字典包含 ``media_data`` 字段
+        （base64 data URI），而不是服务器 URL。
 
         上传文件后，需要通过 :meth:`send_file_message` 将文件信息发送给好友。
 
         Args:
             file_path: 本地文件路径
             mime_type: MIME 类型（可选，自动检测）
+            p2p: 是否优先使用 P2P 传输模式（默认 False）
+            friend_id: 好友账户 ID（P2P 模式时需要，用于判断是否在线）
 
         Returns:
             包含文件信息的字典，例如:
-            ``{"id": "xxx", "url": "/api/v1/chat/files/xxx", "size": 1234, "mimeType": "image/png"}``
+            - 服务器模式: ``{"id": "xxx", "url": "/api/v1/chat/files/xxx", "size": 1234, "mimeType": "image/png"}``
+            - P2P 模式: ``{"filename": "xxx", "size": 1234, "mimeType": "image/png", "media_data": "data:...;base64,...", "p2p": True}``
         """
         import os
         import mimetypes
+        import base64
 
         if not os.path.isfile(file_path):
             raise AICQError(f"文件不存在: {file_path}")
@@ -1153,6 +1161,28 @@ class AICQCore:
             if not mime_type:
                 mime_type = "application/octet-stream"
 
+        # ── P2P mode: read file as base64, skip server upload ──
+        P2P_SIZE_THRESHOLD = 2 * 1024 * 1024  # 2MB
+        file_size = os.path.getsize(file_path)
+
+        if p2p and file_size <= P2P_SIZE_THRESHOLD:
+            with open(file_path, "rb") as f:
+                file_bytes = f.read()
+            b64_data = base64.b64encode(file_bytes).decode("ascii")
+            data_uri = f"data:{mime_type};base64,{b64_data}"
+            logger.info("P2P 模式: 文件 %s (%d bytes) 已读取为 base64", filename, file_size)
+            return {
+                "filename": filename,
+                "size": file_size,
+                "mimeType": mime_type,
+                "media_data": data_uri,
+                "p2p": True,
+                "url": "",
+                "id": "",
+                "thumbUrl": "",
+            }
+
+        # ── Server upload mode (fallback for offline or large files) ──
         session = await self._get_session()
         url = f"{self.server}/api/v1/chat/upload"
         headers = {}
@@ -1173,14 +1203,18 @@ class AICQCore:
                 raise AICQError(f"文件上传失败 HTTP {resp.status}: {result}")
             return result
 
-    async def send_file_message(self, friend_id: str, file_info: Dict[str, Any]):
+    async def send_file_message(self, friend_id: str, file_info: Dict[str, Any], p2p: bool = False):
         """发送文件消息给好友。
 
         需要先调用 :meth:`upload_file` 获取 file_info，再调用此方法发送。
 
+        当 ``p2p=True`` 或 file_info 中包含 ``"p2p": True`` 时，
+        使用 P2P 模式发送文件（media_data 直传），不占用服务器存储。
+
         Args:
             friend_id: 好友账户 ID
             file_info: :meth:`upload_file` 返回的文件信息字典
+            p2p: 是否使用 P2P 传输模式（默认 False，也可由 file_info["p2p"] 决定）
         """
         if self.ws is None or self.ws.closed:
             raise AICQConnectionError("WebSocket 未连接")
@@ -1194,6 +1228,10 @@ class AICQCore:
         is_image = mime_type.startswith("image/")
         msg_type = "image" if is_image else "file"
 
+        # Determine if P2P mode should be used
+        use_p2p = p2p or file_info.get("p2p", False)
+        media_data = file_info.get("media_data", "")
+
         file_content = json.dumps({
             "file_id": file_info.get("id", ""),
             "url": file_info.get("url", ""),
@@ -1203,21 +1241,37 @@ class AICQCore:
             "thumb_url": file_info.get("thumbUrl", ""),
         })
 
+        media_url = file_info.get("url", "")
+        if use_p2p and media_data:
+            media_url = "p2p:local"
+
         msg_obj = {
             "id": f"msg_{int(time.time() * 1000)}_{_uuid.uuid4().hex[:8]}",
             "from_id": agent["account_id"],
             "to_id": friend_id,
             "type": msg_type,
             "content": file_content,
-            "media_url": file_info.get("url", ""),
+            "media_url": media_url,
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
             "status": "sent",
         }
+
+        # In P2P mode, attach media_data to the message so the receiver
+        # gets the file data directly (no server storage needed)
+        if use_p2p and media_data:
+            msg_obj["media_data"] = media_data
+            msg_obj["transfer_mode"] = "p2p"
+
         msg = {
             "type": "message",
             "to": friend_id,
             "data": msg_obj,
         }
+        # Also set transfer_mode at the top level so the server handler
+        # can recognize P2P mode even if msg_data is serialized
+        if use_p2p:
+            msg["transfer_mode"] = "p2p"
+
         await self.ws.send_json(msg)
 
         # 保存到本地记录
@@ -1230,18 +1284,22 @@ class AICQCore:
             msg_type=msg_type,
         )
 
-    async def send_file(self, friend_id: str, file_path: str, mime_type: str = ""):
+    async def send_file(self, friend_id: str, file_path: str, mime_type: str = "", p2p: bool = False):
         """上传文件并发送给好友（一步完成）。
 
         这是 :meth:`upload_file` + :meth:`send_file_message` 的快捷方法。
+
+        当 ``p2p=True`` 时，优先使用 P2P 直传模式：小文件（< 2MB）
+        通过 base64 直传，零服务器存储；大文件回退到服务器上传。
 
         Args:
             friend_id: 好友账户 ID
             file_path: 本地文件路径
             mime_type: MIME 类型（可选，自动检测）
+            p2p: 是否优先使用 P2P 传输模式（默认 False）
         """
-        file_info = await self.upload_file(file_path, mime_type)
-        await self.send_file_message(friend_id, file_info)
+        file_info = await self.upload_file(file_path, mime_type, p2p=p2p, friend_id=friend_id)
+        await self.send_file_message(friend_id, file_info, p2p=p2p)
 
     # ─── 清理 ───────────────────────────────────────────────────
 
