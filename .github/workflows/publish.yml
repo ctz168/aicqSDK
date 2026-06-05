@@ -1,6 +1,11 @@
 # 工作流: 自动构建并发布 aicqSDK 到 PyPI
 # 当 ctz168/aicqSDK 公开仓库的 main 分支收到推送时，
-# 使用 Trusted Publisher (OIDC) 自动发布到 PyPI
+# 使用 PyPI API Token 自动发布到 PyPI
+#
+# 需要在 GitHub 仓库 Settings > Secrets 中配置:
+#   PYPI_API_TOKEN — PyPI API Token (从 https://pypi.org/manage/account/token/ 获取)
+#
+# 未来可切换为 Trusted Publisher 模式（需在 PyPI 上预先配置）
 name: Publish to PyPI
 
 on:
@@ -15,9 +20,6 @@ jobs:
   publish:
     name: Build & Publish to PyPI
     runs-on: ubuntu-latest
-    environment: pypi
-    permissions:
-      id-token: write  # Required for Trusted Publisher
 
     steps:
       - name: Checkout repository
@@ -36,3 +38,5 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
