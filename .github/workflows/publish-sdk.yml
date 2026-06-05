@@ -1,0 +1,47 @@
+name: Build and Publish aicqSDK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'aicq/**'
+      - 'pyproject.toml'
+  workflow_dispatch:
+
+jobs:
+  build-and-publish:
+    name: Build & Publish to PyPI
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # Required for Trusted Publisher (OIDC)
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Replace tunnel URLs with production URLs
+        run: |
+          find aicq -type f -name "*.py" -exec             sed -i 's/acer\.tunnel\.aicq\.online/aicq.online/g' {} +
+
+      - name: Verify server URLs point to aicq.online
+        run: |
+          if grep -r "acer\.tunnel\.aicq\.online" aicq/ 2>/dev/null; then
+            echo "WARNING: Still found acer.tunnel.aicq.online references!"
+            exit 1
+          else
+            echo "All URLs point to aicq.online - clean"
+          fi
+
+      - name: Install build tools
+        run: pip install build
+
+      - name: Build package
+        run: python -m build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
