@@ -707,6 +707,7 @@ async def startLoop(
                                 continue
 
                             msg_type = data.get("type", "")
+                            logger.debug("WS 收到: type=%s from=%s", msg_type, data.get("fromId", data.get("from", ""))[:16])
 
                             # ── 处理私聊消息 ──
                             if msg_type in ("message", "private_message"):
@@ -714,8 +715,10 @@ async def startLoop(
                                 msg_payload = data.get("data", {})
                                 if isinstance(msg_payload, dict):
                                     content = msg_payload.get("content", "")
+                                    inner_type = msg_payload.get("type", "text")
                                 else:
                                     content = str(msg_payload) if msg_payload else ""
+                                    inner_type = "text"
                                 if not content:
                                     content = data.get("content") or data.get("message", "")
 
@@ -725,6 +728,20 @@ async def startLoop(
                                     continue
                                 if msg_id:
                                     message_ids_seen.add(msg_id)
+
+                                # 对文件/图片消息，将 msg_payload 信息注入 content，方便回调解析
+                                if inner_type in ("file", "image") and isinstance(msg_payload, dict):
+                                    try:
+                                        file_meta = json.loads(content) if content.startswith("{") else {}
+                                    except (json.JSONDecodeError, TypeError):
+                                        file_meta = {}
+                                    file_meta["_msg_type"] = inner_type
+                                    if msg_payload.get("media_url"):
+                                        file_meta.setdefault("media_url", msg_payload["media_url"])
+                                    if msg_payload.get("file_id") or msg_payload.get("id"):
+                                        file_meta.setdefault("file_id", msg_payload.get("file_id") or msg_payload.get("id", ""))
+                                    content = json.dumps(file_meta, ensure_ascii=False)
+                                    logger.info("文件/图片消息: type=%s from=%s", inner_type, from_id[:16])
 
                                 if content and from_id:
                                     try:
@@ -763,14 +780,47 @@ async def startLoop(
                                 msg_payload = data.get("data", {})
                                 if isinstance(msg_payload, dict):
                                     content = msg_payload.get("content", "")
+                                    inner_type = msg_payload.get("type", "text")
                                 else:
                                     content = ""
+                                    inner_type = "text"
                                 if not content:
                                     content = data.get("content") or data.get("message", "")
 
+                                # 对群组中的文件/图片消息，注入元数据
+                                if inner_type in ("file", "image") and isinstance(msg_payload, dict):
+                                    try:
+                                        file_meta = json.loads(content) if content.startswith("{") else {}
+                                    except (json.JSONDecodeError, TypeError):
+                                        file_meta = {}
+                                    file_meta["_msg_type"] = inner_type
+                                    if msg_payload.get("media_url"):
+                                        file_meta.setdefault("media_url", msg_payload["media_url"])
+                                    if msg_payload.get("file_id") or msg_payload.get("id"):
+                                        file_meta.setdefault("file_id", msg_payload.get("file_id") or msg_payload.get("id", ""))
+                                    content = json.dumps(file_meta, ensure_ascii=False)
+                                    logger.info("群文件/图片消息: type=%s group=%s from=%s", inner_type, group_id[:16], from_id[:16])
+
+                                # 跳过自己发送的消息
+                                if from_id == identity["account_id"]:
+                                    logger.debug("跳过自己的群消息: %s", group_id[:16])
+                                    continue
+
                                 if content and on_group_message:
                                     try:
-                                        await on_group_message(content, from_id, group_id)
+                                        if _callback_has_ctx:
+                                            group_reply = await on_group_message(content, from_id, group_id, _loop_ctx)
+                                        else:
+                                            group_reply = await on_group_message(content, from_id, group_id)
+                                        # 自动回复群消息
+                                        if group_reply and isinstance(group_reply, str):
+                                            reply_msg = {
+                                                "type": "group_message",
+                                                "groupId": group_id,
+                                                "content": group_reply,
+                                            }
+                                            await ws.send_json(reply_msg)
+                                            logger.info("自动回复群 %s from %s: %s", group_id[:16], from_id[:16], group_reply[:80])
                                     except Exception as e:
                                         logger.error("群组消息回调出错: %s", e, exc_info=True)
                                         if on_error:
@@ -790,12 +840,30 @@ async def startLoop(
                                     except Exception as e:
                                         logger.error("presence 回调出错: %s", e)
 
+                            # ── 群消息确认 ──
+                            elif msg_type == "group_message_ack":
+                                logger.debug("群消息已确认: %s", data.get("messageId", "?")[:16])
+
+                            # ── 好友在线列表 ──
+                            elif msg_type == "friends_online":
+                                logger.debug("在线好友: %s", data.get("nodeIds", []))
+
+                            # ── 未读消息计数 ──
+                            elif msg_type == "unread_counts":
+                                unread = data.get("unread", {})
+                                if unread:
+                                    logger.debug("未读消息: %s", {k[:8]: v for k, v in unread.items()})
+
+                            # ── 在线确认 ──
+                            elif msg_type == "online_ack":
+                                logger.info("WS 认证成功: %s", data.get("nodeId", "?")[:16])
+
                             # ── 心跳 ping 响应 ──
                             elif msg_type == "pong":
                                 logger.debug("收到 pong")
 
                             else:
-                                logger.debug("收到未处理的消息类型: %s", msg_type)
+                                logger.debug("收到未处理的消息类型: %s, data: %s", msg_type, json.dumps(data)[:200])
 
                         elif msg.type == aiohttp.WSMsgType.ERROR:
                             logger.error("WebSocket 错误: %s", ws.exception())

@@ -214,7 +214,7 @@ async def cmd_agent(args: List[str]):
     print(f"  房间名:  {client.room_name}")
     print(f"  你的 ID: {client.ephemeral_id}")
     print(f"  显示名:  {parsed.name}")
-    print(f"  私钥:    {client.private_key[:16]}...")
+    print(f"  私钥:    {client.private_key[:16]}... (已自动保存到本地)")
     print(f"  成员数:  {len(client.members)}")
     print(f"  历史消息: {len(result.get('history', []))} 条")
     if client.expires_at:
@@ -333,8 +333,9 @@ async def cmd_chat(args: List[str]):
     print(f"  你的 ID: {ephemeral_id}")
     print(f"  显示名:  {parsed.name}")
     if raw_token:
-        print(f"  私钥:  {raw_token}")
-        print(f"  ⚠️ 请保存私钥，下次重连时使用 --private-key {raw_token} 复用身份")
+        print(f"  私钥:  {raw_token[:16]}... (已自动保存到本地)")
+        print(f"  💡 私钥已自动持久化，下次 join 同邀请码时自动复用身份")
+        print(f"     如需在其他机器使用: --private-key {raw_token}")
     if expires_at:
         print(f"  过期时间: {expires_at}")
     print("\n输入消息并回车发送，输入 /quit 退出\n")

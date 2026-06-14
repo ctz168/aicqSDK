@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 import logging
 from typing import Optional, Callable, Dict, Any, List
@@ -23,6 +24,67 @@ from . import crypto
 from .db import Database
 
 logger = logging.getLogger("aicq")
+
+# ─── 临时房间密钥持久化 ─────────────────────────────────────────────
+
+EPHEMERAL_DIR = os.path.expanduser("~/.aicq-sdk/ephemeral")
+
+
+def _ephemeral_key_path(invite_code: str) -> str:
+    """根据邀请码返回对应的密钥文件路径。
+
+    每个邀请码对应一个 JSON 文件，保存在 ~/.aicq-sdk/ephemeral/ 目录下。
+    文件名由邀请码小写化生成，避免大小写不一致导致重复创建。
+    """
+    return os.path.join(EPHEMERAL_DIR, f"{invite_code.strip().lower()}.json")
+
+
+def _load_ephemeral_key(invite_code: str) -> Optional[str]:
+    """从本地文件加载临时房间的 private_key。
+
+    如果文件存在且有效，返回保存的 private_key；否则返回 None。
+    """
+    path = _ephemeral_key_path(invite_code)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        key = data.get("private_key", "")
+        if key:
+            logger.info("从文件加载临时房间密钥: invite_code=%s", invite_code)
+            return key
+    except Exception as e:
+        logger.warning("加载临时房间密钥文件失败: %s", e)
+    return None
+
+
+def _save_ephemeral_key(invite_code: str, private_key: str, room_id: str = "",
+                       display_name: str = "") -> None:
+    """将临时房间的 private_key 保存到本地文件。
+
+    保存的内容包括 private_key、room_id、display_name 等，
+    方便下次自动复用身份。文件权限限制为仅所有者可读写。
+    """
+    os.makedirs(EPHEMERAL_DIR, exist_ok=True)
+    path = _ephemeral_key_path(invite_code)
+    try:
+        data = {
+            "invite_code": invite_code.strip().upper(),
+            "private_key": private_key,
+            "room_id": room_id,
+            "display_name": display_name,
+            "saved_at": time.time(),
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        try:
+            os.chmod(path, 0o600)
+        except Exception:
+            pass
+        logger.info("临时房间密钥已保存到: %s", path)
+    except Exception as e:
+        logger.warning("保存临时房间密钥文件失败: %s", e)
 
 
 class AICQError(Exception):
@@ -970,6 +1032,14 @@ class AICQCore:
         避免创建新的临时成员。服务端会在 /api/v1/ephemeral/join
         中验证 private_key 并返回已有身份信息。
 
+        密钥自动持久化策略（内存 → 文件 → 新建）：
+
+        1. 优先使用传入的 ``private_key`` 参数
+        2. 未传入时，尝试从内存缓存 ``_ephemeral`` 中读取
+        3. 内存未命中，从本地文件 ``~/.aicq-sdk/ephemeral/{code}.json`` 读取
+        4. 都没有时，不传 private_key 让服务器创建新身份
+        5. 加入成功后，自动将 private_key 保存到本地文件
+
         Args:
             invite_code: 邀请码
             display_name: 在房间中的显示名称
@@ -978,12 +1048,25 @@ class AICQCore:
         Returns:
             包含 ephemeral_id, token, room_id 等信息的字典
         """
+        # ─── 自动复用密钥（内存 → 文件） ───
+        resolved_key = private_key
+        if not resolved_key and self._ephemeral:
+            # 内存缓存中有，且邀请码匹配
+            if self._ephemeral.get("invite_code", "").upper() == invite_code.strip().upper():
+                resolved_key = self._ephemeral.get("raw_token", "")
+        if not resolved_key:
+            # 从本地文件加载
+            file_key = _load_ephemeral_key(invite_code)
+            if file_key:
+                resolved_key = file_key
+                logger.info("自动复用文件中的临时房间密钥: invite_code=%s", invite_code)
+
         payload = {
             "invite_code": invite_code,
             "display_name": display_name,
         }
-        if private_key:
-            payload["private_key"] = private_key
+        if resolved_key:
+            payload["private_key"] = resolved_key
 
         result = await self._http_post("/api/v1/ephemeral/join", payload)
 
@@ -1008,6 +1091,10 @@ class AICQCore:
             "expires_at": expires_at,
             "members": members,
         }
+
+        # ─── 自动保存密钥到本地文件 ───
+        if raw_token:
+            _save_ephemeral_key(invite_code, raw_token, room_id, display_name)
 
         # 连接 WebSocket
         await self.connect_ephemeral(ephemeral_id, room_id, token)
@@ -1327,6 +1414,7 @@ class AICQAgentClient:
         client = AICQAgentClient()
 
         # 第一次：进群，获取私钥 + 历史消息 + 成员列表 + 用法说明
+        # 私钥会自动保存到本地文件，下次 join 同一邀请码时自动复用
         result = await client.join("RKT22Y", "AI助手")
 
         # 后续：发言 + 等待回复 + 获取新消息（循环调用）
@@ -1343,6 +1431,13 @@ class AICQAgentClient:
         result = client.join_sync("RKT22Y", "AI助手")
         result = client.chat_sync(speak=True, content="你好！", wait_seconds=60)
 
+    密钥自动持久化:
+        调用 ``join()`` 后，private_key 会自动保存到
+        ``~/.aicq-sdk/ephemeral/{邀请码}.json``。
+        下次使用相同邀请码调用 ``join()`` 时，SDK 会自动读取
+        已保存的密钥，无需手动传入 ``private_key`` 参数，
+        从而自动复用已有身份，避免创建新的临时成员。
+
     属性:
         private_key:  服务器分配的私钥，用于后续 chat 调用身份验证
         ephemeral_id: 临时成员 ID（如 eph_xxxx）
@@ -1352,6 +1447,7 @@ class AICQAgentClient:
         latest_timestamp: 最新消息的时间戳（用作下次 chat 的 since 参数）
         expires_at:   房间过期时间
         usage:        后续调用的用法说明
+        invite_code:  最近一次加入的邀请码
     """
 
     def __init__(self, server: str = "https://aicq.online"):
@@ -1364,6 +1460,7 @@ class AICQAgentClient:
         self.latest_timestamp: Optional[str] = None
         self.expires_at: Optional[str] = None
         self.usage: Optional[Dict[str, Any]] = None
+        self.invite_code: Optional[str] = None
 
     # ─── 异步方法 (aiohttp) ───────────────────────────────────────
 
@@ -1373,8 +1470,13 @@ class AICQAgentClient:
         通过 HTTP POST /api/v1/ephemeral/agent/join 加入房间，
         返回私钥、完整历史消息、成员列表和后续用法说明。
 
-        如果提供 ``private_key``，服务器将尝试恢复已有身份，
-        避免创建新的临时成员（实现身份持久化）。
+        密钥自动持久化策略（显式参数 → 内存 → 文件 → 新建）：
+
+        1. 优先使用传入的 ``private_key`` 参数
+        2. 未传入时，尝试从内存缓存（上次 join 的结果）中读取
+        3. 内存未命中，从本地文件 ``~/.aicq-sdk/ephemeral/{code}.json`` 读取
+        4. 都没有时，不传 private_key 让服务器创建新身份
+        5. 加入成功后，自动将 private_key 保存到本地文件
 
         Args:
             invite_code: 房间邀请码（如 RKT22Y）
@@ -1388,14 +1490,28 @@ class AICQAgentClient:
         Raises:
             AICQError: 加入失败
         """
+        code_upper = invite_code.strip().upper()
+
+        # ─── 自动复用密钥（内存 → 文件） ───
+        resolved_key = private_key.strip() if private_key else ""
+        if not resolved_key and self.invite_code and self.invite_code.upper() == code_upper:
+            # 内存缓存中有，且邀请码匹配
+            resolved_key = self.private_key or ""
+        if not resolved_key:
+            # 从本地文件加载
+            file_key = _load_ephemeral_key(invite_code)
+            if file_key:
+                resolved_key = file_key
+                logger.info("自动复用文件中的临时房间密钥: invite_code=%s", code_upper)
+
         async with aiohttp.ClientSession() as session:
             url = f"{self.base_url}/api/v1/ephemeral/agent/join"
             payload = {
-                "invite_code": invite_code.strip().upper(),
+                "invite_code": code_upper,
                 "display_name": display_name.strip(),
             }
-            if private_key:
-                payload["private_key"] = private_key.strip()
+            if resolved_key:
+                payload["private_key"] = resolved_key
             async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                 data = await resp.json()
                 if resp.status != 200:
@@ -1409,15 +1525,21 @@ class AICQAgentClient:
         self.members = data.get("members", [])
         self.expires_at = data.get("expires_at", "")
         self.usage = data.get("usage")
+        self.invite_code = code_upper
 
         # 设置 latest_timestamp 为最后一条消息的时间戳
         history = data.get("history", [])
         if history:
             self.latest_timestamp = history[-1].get("timestamp", "")
 
+        # ─── 自动保存密钥到本地文件 ───
+        if self.private_key:
+            _save_ephemeral_key(code_upper, self.private_key, self.room_id, display_name.strip())
+
         logger.info(
-            "Agent joined room: %s (%s) in %s, history=%d msgs",
+            "Agent joined room: %s (%s) in %s, history=%d msgs, is_rejoin=%s",
             self.ephemeral_id, display_name, self.room_id, len(history),
+            data.get("is_rejoin", False),
         )
         return data
 
@@ -1475,16 +1597,29 @@ class AICQAgentClient:
         """加入临时房间（同步版本，使用 requests 库）。
 
         参数和返回值与 ``join()`` 相同，适用于非 asyncio 环境。
+        同样支持密钥自动持久化（内存 → 文件 → 新建）。
         """
         import requests
 
+        code_upper = invite_code.strip().upper()
+
+        # ─── 自动复用密钥（内存 → 文件） ───
+        resolved_key = private_key.strip() if private_key else ""
+        if not resolved_key and self.invite_code and self.invite_code.upper() == code_upper:
+            resolved_key = self.private_key or ""
+        if not resolved_key:
+            file_key = _load_ephemeral_key(invite_code)
+            if file_key:
+                resolved_key = file_key
+                logger.info("自动复用文件中的临时房间密钥: invite_code=%s", code_upper)
+
         url = f"{self.base_url}/api/v1/ephemeral/agent/join"
         payload = {
-            "invite_code": invite_code.strip().upper(),
+            "invite_code": code_upper,
             "display_name": display_name.strip(),
         }
-        if private_key:
-            payload["private_key"] = private_key.strip()
+        if resolved_key:
+            payload["private_key"] = resolved_key
         resp = requests.post(url, json=payload, timeout=30)
         data = resp.json()
         if resp.status_code != 200:
@@ -1497,10 +1632,15 @@ class AICQAgentClient:
         self.members = data.get("members", [])
         self.expires_at = data.get("expires_at", "")
         self.usage = data.get("usage")
+        self.invite_code = code_upper
 
         history = data.get("history", [])
         if history:
             self.latest_timestamp = history[-1].get("timestamp", "")
+
+        # ─── 自动保存密钥到本地文件 ───
+        if self.private_key:
+            _save_ephemeral_key(code_upper, self.private_key, self.room_id, display_name.strip())
 
         return data
 
